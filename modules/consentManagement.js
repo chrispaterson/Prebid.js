@@ -23,7 +23,13 @@ export let consentTimeout;
 export let gdprScope;
 export let staticConsentData;
 
-let cmpVersion = 0;
+const CMP_VERSION = {
+  NONE: 0,
+  ONE: 1,
+  TWO: 2
+};
+
+let cmpVersion = CMP_VERSION.NONE;
 let consentData;
 let addedConsentHook = false;
 
@@ -32,6 +38,7 @@ const cmpCallMap = {
   'iab': lookupIabConsent,
   'static': lookupStaticConsentData
 };
+
 
 /**
  * This function reads the consent string from the config to obtain the consent information of the user.
@@ -52,59 +59,44 @@ function lookupStaticConsentData(cmpSuccess, cmpError, hookConfig) {
  * @param {object} hookConfig contains module related variables (see comment in requestBidsHook function)
  */
 function lookupIabConsent(cmpSuccess, cmpError, hookConfig) {
-  function findCMP() {
+
+  let cmpFrame;
+  let cmpFunction;
+
+  function findCMPMaybe() {
     let f = window;
-    let cmpFrame;
-    let cmpFunction;
     while (!cmpFrame) {
-      try {
-        if (typeof f.__tcfapi === 'function' || typeof f.__cmp === 'function') {
-          if (typeof f.__tcfapi === 'function') {
-            cmpVersion = 2;
-            cmpFunction = f.__tcfapi;
-          } else {
-            cmpVersion = 1;
-            cmpFunction = f.__cmp;
-          }
-          cmpFrame = f;
-          break;
-        }
-      } catch (e) { }
 
       // need separate try/catch blocks due to the exception errors thrown when trying to check for a frame that doesn't exist in 3rd party env
       try {
         if (f.frames['__tcfapiLocator']) {
-          cmpVersion = 2;
+          cmpVersion = CMP_VERSION.TWO;
           cmpFrame = f;
-          break;
+          if (typeof f.__tcfapi === 'function') {
+            cmpFunction = f.__tcfapi;
+          }
         }
       } catch (e) { }
 
       try {
         if (f.frames['__cmpLocator']) {
-          cmpVersion = 1;
+          cmpVersion = CMP_VERSION.ONE;
           cmpFrame = f;
-          break;
+          if (typeof f.__cmp === 'function') {
+            cmpFunction = f.__cmp;
+          }
         }
       } catch (e) { }
 
       if (f === window.top) break;
       f = f.parent;
     }
-    return {
-      cmpFrame,
-      cmpFunction
-    };
   }
 
   function v2CmpResponseCallback(tcfData, success) {
     utils.logInfo('Received a response from CMP', tcfData);
     if (success) {
-      if (tcfData.eventStatus === 'tcloaded' || tcfData.eventStatus === 'useractioncomplete') {
-        cmpSuccess(tcfData, hookConfig);
-      } else if (tcfData.eventStatus === 'cmpuishown' && tcfData.tcString && tcfData.purposeOneTreatment === true) {
-        cmpSuccess(tcfData, hookConfig);
-      }
+      cmpSuccess(tcfData, hookConfig);
     } else {
       cmpError('CMP unable to register callback function.  Please check CMP setup.', hookConfig);
     }
@@ -132,13 +124,10 @@ function lookupIabConsent(cmpSuccess, cmpError, hookConfig) {
     }
   }
 
-  let v1CallbackHandler = handleV1CmpResponseCallbacks();
-  let cmpCallbacks = {};
-  let { cmpFrame, cmpFunction } = findCMP();
+  findCMPMaybe();
 
-  if (!cmpFrame) {
-    return cmpError('CMP not found.', hookConfig);
-  }
+  const cmpCallbacks = {};
+
   // to collect the consent information from the user, we perform two calls to the CMP in parallel:
   // first to collect the user's consent choices represented in an encoded string (via getConsentData)
   // second to collect the user's full unparsed consent information (via getVendorConsents)
@@ -149,31 +138,32 @@ function lookupIabConsent(cmpSuccess, cmpError, hookConfig) {
   // else assume prebid may be inside an iframe and use the IAB CMP locator code to see if CMP's located in a higher parent window. this works in cross domain iframes
   // if the CMP is not found, the iframe function will call the cmpError exit callback to abort the rest of the CMP workflow
 
-  if (utils.isFn(cmpFunction)) {
-    utils.logInfo('Detected CMP API is directly accessible, calling it now...');
-    if (cmpVersion === 1) {
-      cmpFunction('getConsentData', null, v1CallbackHandler.consentDataCallback);
-      cmpFunction('getVendorConsents', null, v1CallbackHandler.vendorConsentsCallback);
-    } else if (cmpVersion === 2) {
-      cmpFunction('addEventListener', cmpVersion, v2CmpResponseCallback);
-    }
-  } else if (cmpVersion === 1 && inASafeFrame() && typeof window.$sf.ext.cmp === 'function') {
-    // this safeframe workflow is only supported with TCF v1 spec; the v2 recommends to use the iframe postMessage route instead (even if you are in a safeframe).
-    utils.logInfo('Detected Prebid.js is encased in a SafeFrame and CMP is registered, calling it now...');
-    callCmpWhileInSafeFrame('getConsentData', v1CallbackHandler.consentDataCallback);
-    callCmpWhileInSafeFrame('getVendorConsents', v1CallbackHandler.vendorConsentsCallback);
-  } else {
-    utils.logInfo('Detected CMP is outside the current iframe where Prebid.js is located, calling it now...');
-    if (cmpVersion === 1) {
-      callCmpWhileInIframe('getConsentData', cmpFrame, v1CallbackHandler.consentDataCallback);
-      callCmpWhileInIframe('getVendorConsents', cmpFrame, v1CallbackHandler.vendorConsentsCallback);
-    } else if (cmpVersion === 2) {
-      callCmpWhileInIframe('addEventListener', cmpFrame, v2CmpResponseCallback);
-    }
-  }
-
-  function inASafeFrame() {
-    return !!(window.$sf && window.$sf.ext);
+  switch(cmpVersion) {
+    case CMP_VERSION.TWO:
+      if (utils.isFn(cmpFunction)) {
+        utils.logInfo('Detected CMP API is directly accessible, calling it now...');
+        cmpFunction('addEventListener', cmpVersion, v2CmpResponseCallback);
+      } else {
+        utils.logInfo('Detected CMP is outside the current iframe where Prebid.js is located, calling it now...');
+        callCmpWhileInIframe('addEventListener', cmpFrame, v2CmpResponseCallback);
+      }
+      break;
+    case CMP_VERSION.ONE:
+      const v1CallbackHandler = handleV1CmpResponseCallbacks();
+      if (utils.isFn(cmpFunction)) {
+        cmpFunction('getConsentData', null, v1CallbackHandler.consentDataCallback);
+        cmpFunction('getVendorConsents', null, v1CallbackHandler.vendorConsentsCallback);
+      } else if (window.$sf && window.$sf.ext && typeof window.$sf.ext.cmp === 'function') {
+        utils.logInfo('Detected Prebid.js is encased in a SafeFrame and CMP is registered, calling it now...');
+        callCmpWhileInSafeFrame('getConsentData', v1CallbackHandler.consentDataCallback);
+        callCmpWhileInSafeFrame('getVendorConsents', v1CallbackHandler.vendorConsentsCallback);
+      } else {
+        callCmpWhileInIframe('getConsentData', cmpFrame, v1CallbackHandler.consentDataCallback);
+        callCmpWhileInIframe('getVendorConsents', cmpFrame, v1CallbackHandler.vendorConsentsCallback);
+      }
+      break;
+    default:
+      return cmpError('CMP not found.', hookConfig);
   }
 
   function callCmpWhileInSafeFrame(commandName, callback) {
@@ -199,7 +189,7 @@ function lookupIabConsent(cmpSuccess, cmpError, hookConfig) {
   }
 
   function callCmpWhileInIframe(commandName, cmpFrame, moduleCallback) {
-    let apiName = (cmpVersion === 2) ? '__tcfapi' : '__cmp';
+    let apiName = (cmpVersion === CMP_VERSION.TWO) ? '__tcfapi' : '__cmp';
 
     /* Setup up a __cmp function to do the postMessage and stash the callback.
       This function behaves (from the caller's perspective identicially to the in-frame __cmp call */
@@ -213,7 +203,7 @@ function lookupIabConsent(cmpSuccess, cmpError, hookConfig) {
           callId: callId
         }
       };
-      if (cmpVersion !== 1) msg[callName].version = cmpVersion;
+      if (cmpVersion !== CMP_VERSION.ONE) msg[callName].version = cmpVersion;
 
       cmpCallbacks[callId] = callback;
       cmpFrame.postMessage(msg, '*');
@@ -315,20 +305,20 @@ function processCmpData(consentObject, hookConfig) {
 
   // do extra things for static config
   if (userCMP === 'static') {
-    cmpVersion = (consentObject.getConsentData) ? 1 : (consentObject.getTCData) ? 2 : 0;
+    cmpVersion = (consentObject.getConsentData) ? CMP_VERSION.ONE : (consentObject.getTCData) ? CMP_VERSION.TWO : CMP_VERSION.NONE;
     // remove extra layer in static v2 data object so it matches normal v2 CMP object for processing step
-    if (cmpVersion === 2) {
+    if (cmpVersion === CMP_VERSION.TWO) {
       consentObject = consentObject.getTCData;
     }
   }
 
   // determine which set of checks to run based on cmpVersion
-  let checkFn = (cmpVersion === 1) ? checkV1Data : (cmpVersion === 2) ? checkV2Data : null;
+  let checkFn = (cmpVersion === CMP_VERSION.ONE) ? checkV1Data : (cmpVersion === CMP_VERSION.TWO) ? checkV2Data : null;
 
   // Raise deprecation warning if 'allowAuctionWithoutConsent' is used with TCF 2.
-  if (allowAuction.definedInConfig && cmpVersion === 2) {
+  if (allowAuction.definedInConfig && cmpVersion === CMP_VERSION.TWO) {
     utils.logWarn(`'allowAuctionWithoutConsent' ignored for TCF 2`);
-  } else if (!allowAuction.definedInConfig && cmpVersion === 1) {
+  } else if (!allowAuction.definedInConfig && cmpVersion === CMP_VERSION.ONE) {
     utils.logInfo(`'allowAuctionWithoutConsent' using system default: (${DEFAULT_ALLOW_AUCTION_WO_CONSENT}).`);
   }
 
@@ -362,7 +352,7 @@ function cmpFailed(errMsg, hookConfig, extraArgs) {
   clearTimeout(hookConfig.timer);
 
   // still set the consentData to undefined when there is a problem as per config options
-  if (allowAuction.value && cmpVersion === 1) {
+  if (allowAuction.value && cmpVersion === CMP_VERSION.ONE) {
     storeConsentData(undefined);
   }
   exitModule(errMsg, hookConfig, extraArgs);
@@ -373,7 +363,7 @@ function cmpFailed(errMsg, hookConfig, extraArgs) {
  * @param {object} cmpConsentObject required; an object representing user's consent choices (can be undefined in certain use-cases for this function only)
  */
 function storeConsentData(cmpConsentObject) {
-  if (cmpVersion === 1) {
+  if (cmpVersion === CMP_VERSION.ONE) {
     consentData = {
       consentString: (cmpConsentObject) ? cmpConsentObject.getConsentData.consentData : undefined,
       vendorData: (cmpConsentObject) ? cmpConsentObject.getVendorConsents : undefined,
@@ -416,7 +406,7 @@ function exitModule(errMsg, hookConfig, extraArgs) {
     let nextFn = hookConfig.nextFn;
 
     if (errMsg) {
-      if (allowAuction.value && cmpVersion === 1) {
+      if (allowAuction.value && cmpVersion === CMP_VERSION.ONE) {
         utils.logWarn(errMsg + ` 'allowAuctionWithoutConsent' activated.`, extraArgs);
         nextFn.apply(context, args);
       } else {
@@ -439,7 +429,7 @@ function exitModule(errMsg, hookConfig, extraArgs) {
 export function resetConsentData() {
   consentData = undefined;
   userCMP = undefined;
-  cmpVersion = 0;
+  cmpVersion = CMP_VERSION.NONE;
   gdprDataHandler.setConsentData(null);
 }
 
